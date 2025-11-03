@@ -580,24 +580,52 @@ def add_indicator(driver: webdriver.Chrome, keyword: str) -> None:
             time.sleep(2)
     logger.warning(f"INDICATOR: 최종 실패 → {keyword}")
 
+def _click_first(driver: webdriver.Chrome, selectors: List[str], wait: int = 15) -> None:
+    """여러 XPATH 중 먼저 클릭 가능한 요소를 클릭한다."""
+    last_exc: Optional[Exception] = None
+    for selector in selectors:
+        try:
+            element = WebDriverWait(driver, wait).until(
+                EC.element_to_be_clickable((By.XPATH, selector))
+            )
+            driver.execute_script("arguments[0].click();", element)
+            return
+        except Exception as exc:  # pragma: no cover - selenium runtime
+            last_exc = exc
+            continue
+    if last_exc is not None:
+        raise last_exc
+    raise TimeoutException("클릭 가능한 요소를 찾지 못했습니다.")
+
+
 def export_csv(driver: webdriver.Chrome) -> None:
     logger.info("EXPORT: CSV 내보내기 시작")
-    export_btn = WebDriverWait(driver, 15).until(
-        EC.element_to_be_clickable((By.XPATH, "//button[contains(@aria-label, 'Export')]") )
-    )
-    export_btn.click()
+
+    export_button_selectors = [
+        "//button[contains(@aria-label, 'Export')]",
+        "//button[contains(@data-name, 'export-chart-data')]",
+        "//div[contains(@data-name, 'header-toolbar')]//button[.//span[contains(text(), 'Export')]]",
+        "//button[contains(., '내보내기')]",
+    ]
+    _click_first(driver, export_button_selectors)
     time.sleep(1)
-    export_csv_xpath = "//div[contains(text(), 'Export chart data')]"
-    export_csv_btn = WebDriverWait(driver, 15).until(
-        EC.element_to_be_clickable((By.XPATH, export_csv_xpath))
-    )
-    export_csv_btn.click()
+
+    export_menu_selectors = [
+        "//div[@role='menuitem' or @role='option']//span[contains(text(), 'Export chart data')]",
+        "//div[contains(@class, 'menu')]//div[contains(text(), 'Export chart data')]",
+        "//div[@role='menuitem' or @role='option']//span[contains(text(), '내보내기')]",
+        "//div[contains(@data-name, 'menu')]//span[contains(text(), 'Download data')]",
+    ]
+    _click_first(driver, export_menu_selectors)
     time.sleep(1)
-    final_export_xpath = "//button[contains(., 'Export')]"
-    final_export_btn = WebDriverWait(driver, 15).until(
-        EC.element_to_be_clickable((By.XPATH, final_export_xpath))
-    )
-    final_export_btn.click()
+
+    final_export_selectors = [
+        "//button[contains(@class, 'button') and .//span[contains(text(), 'Export')]]",
+        "//button[contains(@class, 'button') and contains(text(), 'Export')]",
+        "//button[contains(@aria-label, 'export-data-dialog-export-button')]",
+        "//button[contains(., '내보내기')]",
+    ]
+    _click_first(driver, final_export_selectors)
     logger.info("EXPORT: 실행 완료")
 
 def wait_for_download(download_dir: Path, timeout: int = 90) -> Path:
