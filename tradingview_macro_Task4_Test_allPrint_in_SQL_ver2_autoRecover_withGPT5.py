@@ -18,6 +18,7 @@ pip install selenium pymysql sshtunnel python-dotenv webdriver-manager tqdm pand
 """
 
 from __future__ import annotations
+import argparse
 import os
 import sys
 import csv
@@ -29,28 +30,69 @@ from typing import List, Dict, Optional
 from datetime import datetime
 import logging
 import shutil
+import tempfile
 
 # ---- 추가 패키지 ----
-import pandas as pd
-from tqdm import tqdm
+try:
+    import pandas as pd
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    pd = None
+
+try:
+    from tqdm import tqdm as _tqdm
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    def _tqdm(iterable, *args, **kwargs):
+        """Fallback tqdm replacement that simply iterates."""
+        for item in iterable:
+            yield item
+
+tqdm = _tqdm
+
+# 누락 여부 추적 (필수 의존성)
+CRITICAL_DEPENDENCIES: List[str] = []
 
 # DB 관련 모듈
-from sshtunnel import SSHTunnelForwarder
-import pymysql
-from dotenv import load_dotenv
+try:
+    from sshtunnel import SSHTunnelForwarder
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    SSHTunnelForwarder = None
+    CRITICAL_DEPENDENCIES.append("sshtunnel")
+
+try:
+    import pymysql
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    pymysql = None
+    CRITICAL_DEPENDENCIES.append("pymysql")
+
+try:
+    from dotenv import load_dotenv
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    def load_dotenv(*_args, **_kwargs):
+        """Fallback when python-dotenv is unavailable."""
+        return False
 
 # 웹 크롤링 관련 모듈
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException, ElementClickInterceptedException
-from selenium.webdriver.common.action_chains import ActionChains
+try:
+    from selenium import webdriver
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.common.exceptions import TimeoutException, NoSuchElementException, ElementClickInterceptedException
+    from selenium.webdriver.common.action_chains import ActionChains
+    from selenium.webdriver.chrome.service import Service
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    webdriver = None
+    By = Options = WebDriverWait = EC = TimeoutException = NoSuchElementException = ElementClickInterceptedException = ActionChains = None
+    Service = None
+    CRITICAL_DEPENDENCIES.append("selenium")
 
 # ChromeDriver 자동 설치
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
+try:
+    from webdriver_manager.chrome import ChromeDriverManager
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    ChromeDriverManager = None
+    CRITICAL_DEPENDENCIES.append("webdriver-manager")
 
 # -----------------------------
 # SSH 및 DB 설정 (필요시 .env 로 오버라이드)
@@ -137,6 +179,8 @@ def ensure_dir(p: Path) -> None:
 # -----------------------------
 def create_ssh_tunnel() -> SSHTunnelForwarder:
     """SSH 터널 생성"""
+    if SSHTunnelForwarder is None:
+        raise RuntimeError("sshtunnel 패키지가 설치되어야 합니다.")
     logger.info("DB: SSH 터널 연결 시도...")
     tunnel = SSHTunnelForwarder(
         (SSH_HOST, SSH_PORT),
@@ -151,6 +195,8 @@ def create_ssh_tunnel() -> SSHTunnelForwarder:
 
 def db_connect() -> pymysql.Connection:
     """MariaDB 연결"""
+    if pymysql is None:
+        raise RuntimeError("pymysql 패키지가 설치되어야 합니다.")
     logger.info("DB: MariaDB 연결 시도...")
     try:
         conn = pymysql.connect(
@@ -317,6 +363,8 @@ def save_to_db(conn: pymysql.Connection, data: list, symbol: str, timeframe: str
 # -----------------------------
 def setup_driver(download_dir: Path) -> webdriver.Chrome:
     """Chrome 드라이버 설정 (webdriver_manager 자동 설치)"""
+    if webdriver is None or Options is None or ChromeDriverManager is None or Service is None:
+        raise RuntimeError("selenium 및 webdriver-manager 패키지가 설치되어야 합니다.")
     logger.info("DRIVER: Chrome 드라이버 설정...")
     ensure_dir(USER_PROFILE_DIR)
     ensure_dir(download_dir)
@@ -653,22 +701,118 @@ def get_completed_symbols(summary_file: Path) -> set:
     if not summary_file.exists():
         return set()
     try:
-        df = pd.read_csv(summary_file)
-        completed = set(df.loc[df["status"] == "success", "symbol"])
+        if pd is not None:
+            df = pd.read_csv(summary_file)
+            completed = set(df.loc[df["status"] == "success", "symbol"])
+            return completed
+        # pandas 미설치 시 CSV 모드로 처리
+        completed: set = set()
+        with summary_file.open(encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get("status") == "success" and row.get("symbol"):
+                    completed.add(row["symbol"])
         return completed
     except Exception:
         return set()
 
 def save_summary(summary: list, summary_file: Path) -> None:
-    df = pd.DataFrame(summary)
-    df["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    df.to_csv(summary_file, index=False, encoding="utf-8-sig")
+    ensure_dir(summary_file)
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if pd is not None:
+        df = pd.DataFrame(summary)
+        df["timestamp"] = timestamp
+        df.to_csv(summary_file, index=False, encoding="utf-8-sig")
+    else:
+        fieldnames = ["symbol", "status", "attempt", "inserted_rows", "error", "timestamp"]
+        with summary_file.open("w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in summary:
+                row_copy = dict(row)
+                row_copy["timestamp"] = timestamp
+                writer.writerow({k: row_copy.get(k, "") for k in fieldnames})
     logger.info(f"📊 실행 결과 요약 저장 → {summary_file}")
+
+# -----------------------------
+# 진단 도구
+# -----------------------------
+def run_self_test() -> None:
+    """외부 의존성 없이 핵심 전처리/요약 로직을 빠르게 점검."""
+    print("\n" + "-" * 60)
+    print(" Running self-test (no external services required) ")
+    print("-" * 60)
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="tv_task4_test_"))
+    try:
+        sample_csv = temp_dir / "sample.csv"
+        with sample_csv.open("w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=["time", "open", "high", "low", "close", "volume", "rsi", "macd"],
+            )
+            writer.writeheader()
+            writer.writerow({
+                "time": "2024-01-01 09:00:00",
+                "open": "100",
+                "high": "110",
+                "low": "95",
+                "close": "105",
+                "volume": "1,000",
+                "rsi": "55.5",
+                "macd": "0.8",
+            })
+            writer.writerow({
+                "time": "2024-01-02 09:00:00",
+                "open": "105",
+                "high": "112",
+                "low": "101",
+                "close": "108",
+                "volume": "1,200",
+                "rsi": "57.1",
+                "macd": "0.9",
+            })
+
+        processed = process_csv_for_db(sample_csv, "TEST", "D")
+        if not processed:
+            raise RuntimeError("CSV processing self-test failed: no rows processed")
+
+        summary_path = temp_dir / "summary.csv"
+        summary_rows = [{
+            "symbol": "TEST",
+            "status": "success",
+            "attempt": 1,
+            "inserted_rows": len(processed),
+            "error": "",
+        }]
+        save_summary(summary_rows, summary_path)
+        completed = get_completed_symbols(summary_path)
+        if "TEST" not in completed:
+            raise RuntimeError("Summary read self-test failed: symbol not detected")
+
+        print("Self-test completed successfully. All offline checks passed.\n")
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 # -----------------------------
 # 메인
 # -----------------------------
-def main():
+def main(argv: Optional[List[str]] = None) -> None:
+    parser = argparse.ArgumentParser(description="TradingView 데이터 수집 자동화 스크립트")
+    parser.add_argument("--self-test", action="store_true", help="외부 서비스 없이 핵심 로직을 점검")
+    args = parser.parse_args(argv)
+
+    if args.self_test:
+        run_self_test()
+        return
+
+    if CRITICAL_DEPENDENCIES:
+        missing = ", ".join(sorted(set(CRITICAL_DEPENDENCIES)))
+        raise SystemExit(
+            "필수 패키지가 누락되었습니다. pip install 로 설치 후 다시 실행하세요: "
+            f"{missing}"
+        )
+
     print("\n" + "="*60)
     print(" TradingView 데이터 수집 + DB 저장 자동화 (ver2 Auto-Recover) ")
     print("="*60 + "\n")
@@ -739,6 +883,7 @@ def main():
         except Exception:
             pass
         print("\n프로그램 종료")
+
 
 if __name__ == "__main__":
     main()
