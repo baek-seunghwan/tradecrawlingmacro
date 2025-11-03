@@ -625,7 +625,7 @@ def wait_for_download(download_dir: Path, timeout: int = 90) -> Path:
 # -----------------------------
 # 심볼 처리 with 재시도
 # -----------------------------
-def process_symbol(driver: webdriver.Chrome, symbol: str, download_dir: Path, db_conn: pymysql.Connection) -> Dict[str, int]:
+def process_symbol(driver: webdriver.Chrome, symbol: str, download_dir: Path, db_conn: pymysql.Connection, progress_bar: Optional[object] = None) -> Dict[str, int]:
     """한 종목의 모든 TF 처리. 반환: {'inserted_rows': n}"""
     logger.info(f"{'='*18} [{symbol}] 처리 시작 {'='*18}")
     inserted_total = 0
@@ -673,17 +673,23 @@ def process_symbol(driver: webdriver.Chrome, symbol: str, download_dir: Path, db
             logger.info(f"[{symbol}] {tf_short} 완료: 파일={target_file.name}, 저장행수={len(data)}")
         except Exception as e:
             logger.error(f"[{symbol}] {tf_short} 처리 오류: {e}")
-            continue
+        finally:
+            # 전체 진행률 바가 전달되면 TF 단위로 진행률을 갱신
+            if progress_bar is not None:
+                try:
+                    progress_bar.update(1)
+                except Exception:
+                    pass
 
     logger.info(f"{'='*18} [{symbol}] 처리 완료 (총 저장행수={inserted_total}) {'='*18}\n")
     return {"inserted_rows": inserted_total}
 
-def process_symbol_with_retry(driver, symbol, download_dir, db_conn, retries=3) -> Dict[str, int]:
+def process_symbol_with_retry(driver, symbol, download_dir, db_conn, retries=3, progress_bar: Optional[object] = None) -> Dict[str, int]:
     last_err = None
     for attempt in range(1, retries+1):
         try:
             logger.info(f"[{symbol}] 시도 {attempt}/{retries}")
-            result = process_symbol(driver, symbol, download_dir, db_conn)
+            result = process_symbol(driver, symbol, download_dir, db_conn, progress_bar=progress_bar)
             return {"status": "success", "attempt": attempt, **result}
         except Exception as e:
             last_err = e
@@ -830,6 +836,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     tunnel = None
     db_conn = None
     summary_rows = []
+    task_bar = None
 
     try:
         driver = setup_driver(DOWNLOAD_ROOT)
@@ -841,19 +848,28 @@ def main(argv: Optional[List[str]] = None) -> None:
         tunnel = create_ssh_tunnel()
         db_conn = db_connect()
 
-        # 진행률 표시
-        for symbol in tqdm(pending, desc="📈 남은 종목 처리", unit="symbol"):
-            result = process_symbol_with_retry(driver, symbol, DOWNLOAD_ROOT, db_conn, retries=3)
-            row = {
-                "symbol": symbol,
-                "status": result.get("status", "fail"),
-                "attempt": result.get("attempt", 0),
-                "inserted_rows": result.get("inserted_rows", 0),
-                "error": result.get("error", "")
-            }
-            summary_rows.append(row)
-            # 즉시 저장(중간 저장) → 비정상 종료에도 복구 용이
-            save_summary(summary_rows, summary_file)
+        # 전체 TF 기반 진행률 표시
+        total_tasks = max(1, len(pending) * len(TIMEFRAMES))
+        task_bar = tqdm(total=total_tasks, desc="전체 진행", unit="TF")
+        try:
+            for symbol in tqdm(pending, desc="📈 남은 종목 처리", unit="symbol"):
+                result = process_symbol_with_retry(driver, symbol, DOWNLOAD_ROOT, db_conn, retries=3, progress_bar=task_bar)
+                row = {
+                    "symbol": symbol,
+                    "status": result.get("status", "fail"),
+                    "attempt": result.get("attempt", 0),
+                    "inserted_rows": result.get("inserted_rows", 0),
+                    "error": result.get("error", "")
+                }
+                summary_rows.append(row)
+                # 즉시 저장(중간 저장) → 비정상 종료에도 복구 용이
+                save_summary(summary_rows, summary_file)
+        finally:
+            try:
+                if task_bar is not None:
+                    task_bar.close()
+            except Exception:
+                pass
 
     except Exception as e:
         logger.error(f"치명적 오류: {e}\n{traceback.format_exc()}")
